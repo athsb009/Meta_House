@@ -48,6 +48,22 @@ module.exports = (socket, gameNamespace) => {
         existingPlayers: room.players,
       });
     });
+    socket.on("chatMessage", (message) => {
+      /**
+       * `message` structure from client might look like:
+       * {
+       *   roomId: "some-room-id",
+       *   username: "bob",
+       *   text: "Hello everyone!"
+       * }
+       */
+      const { roomId } = message;
+      // Broadcast to *all* clients in the room (including sender):
+      gameNamespace.to(roomId).emit("chatMessage", message);
+  
+      // If you only want to broadcast to everyone EXCEPT the sender, use:
+      // socket.to(roomId).emit("chatMessage", message);
+    });
   
     socket.on('move', (data) => {
       const roomId = socket.roomId;

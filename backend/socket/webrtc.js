@@ -1,5 +1,6 @@
 // webrtc.js
 const mediasoup = require('mediasoup');
+const Room = require('../components/room');
 
 // These are your Mediasoup router's media codecs
 const mediaCodecs = [
@@ -19,18 +20,20 @@ const mediaCodecs = [
   },
 ];
 
-// Global map for rooms
-// Each room: { router, producers: Map<peerId, Producer[]> }
+// Global map for rooms (keyed by roomId)
 const rooms = new Map();
+// Global map for shared room IDs keyed by sessionId.
+// This ensures that for a given session, only one shared roomId is used.
+const sharedRooms = new Map();
+const sessions = new Map();
 
 // Configure your transport options
 const webRtcTransportOptions = {
   listenIps: [
     {
       ip: '0.0.0.0',
-      // In production, set this to your public IP or domain:
-      // e.g. announcedIp: '123.45.67.89'
-      announcedIp: '127.0.0.1', // For local dev only
+      // For production, set this to your public IP/domain
+      announcedIp: '127.0.0.1', // Local development only
     },
   ],
   enableUdp: true,
@@ -54,47 +57,78 @@ const initWebRTC = (io, worker) => {
       console.log(`Socket ${socket.id} joined room ${roomId}`);
       socket.to(roomId).emit('peerJoined', { peerId: socket.id });
 
-      // Create a new room with a Mediasoup router if it doesn't exist
+      // Create room if it doesn't exist
       if (!rooms.has(roomId)) {
         try {
           const router = await worker.createRouter({ mediaCodecs });
-          // CHANGED: Store producers as a Map of arrays
-          rooms.set(roomId, {
-            router,
-            producers: new Map(), // Map<peerId, Producer[]>
-          });
+          rooms.set(roomId, new Room(roomId, router));
           console.log(`Created new room ${roomId} with router ${router.id}`);
         } catch (error) {
           console.error('Error creating router:', error);
           return callback({ error: error.message });
         }
       }
-
       const room = rooms.get(roomId);
+      room.addPeer(socket.id, {}); // Optionally, add user info here
 
-      // Collect all existing producers in the room across all peers
-      // CHANGED: we loop over the map of arrays, not single producers
+      // Gather all existing producers from peers in this room
       const existingProducers = [];
       for (const [peerId, producersArray] of room.producers.entries()) {
-        if (peerId === socket.id) {
-          continue;
-        }
+        if (peerId === socket.id) continue;
         for (const prod of producersArray) {
           existingProducers.push({ producerId: prod.id, peerId });
         }
       }
-
       callback({ existingProducers });
     });
+
+    // ---------------------------
+    // ROOM-ID-UPDATE: Coordinate shared room ID
+    // ---------------------------
+    socket.on('requestSessionId', ({ peerId }, callback) => {
+      const sessionId = uuidv4();
+      sessions.set(sessionId, { peers: [socket.id, peerId] });
+      
+      // Notify both peers about the new session
+      io.to(socket.id).emit('newSession', { sessionId, peerId });
+      io.to(peerId).emit('newSession', { sessionId, peerId: socket.id });
+      
+      callback({ sessionId });
+    });
+  
+    // Modified room-id-update handler
+    socket.on('room-id-update', async ({ sessionId, newRoomId }) => {
+      const session = sessions.get(sessionId);
+      if (!session) return;
+  
+      // Move all peers in session to new room
+      session.peers.forEach(peerId => {
+        const peerSocket = io.sockets.sockets.get(peerId);
+        if (!peerSocket) return;
+  
+        // Leave current room and join new
+        peerSocket.leave(peerSocket.roomId);
+        peerSocket.join(newRoomId);
+        peerSocket.roomId = newRoomId;
+  
+        // Update client-side state
+        io.to(peerId).emit('room-id-update', { 
+          sessionId, 
+          roomId: newRoomId 
+        });
+      });
+  
+      // Update session room mapping
+      sessions.set(sessionId, { ...session, roomId: newRoomId });
+    });
+    
 
     // ---------------------------
     // GET RTP CAPABILITIES
     // ---------------------------
     socket.on('getRtpCapabilities', (callback) => {
       const room = rooms.get(socket.roomId);
-      if (!room) {
-        return callback({ error: 'Room not found' });
-      }
+      if (!room) return callback({ error: 'Room not found' });
       callback({ rtpCapabilities: room.router.rtpCapabilities });
     });
 
@@ -103,18 +137,14 @@ const initWebRTC = (io, worker) => {
     // ---------------------------
     socket.on('createWebRtcTransport', async ({ sender }, callback) => {
       const room = rooms.get(socket.roomId);
-      if (!room) {
-        return callback({ params: { error: 'Room not found' } });
-      }
+      if (!room) return callback({ params: { error: 'Room not found' } });
       try {
         const transport = await room.router.createWebRtcTransport(webRtcTransportOptions);
         console.log(`Created transport ${transport.id} for socket ${socket.id}`);
 
         if (sender) {
-          // Single send transport per peer. This can produce multiple tracks.
           socket.producerTransport = transport;
         } else {
-          // Single receive transport per peer. This can consume multiple tracks.
           socket.consumerTransport = transport;
         }
 
@@ -150,25 +180,17 @@ const initWebRTC = (io, worker) => {
       try {
         const producer = await socket.producerTransport.produce({ kind, rtpParameters });
         console.log(`Producer ${producer.id} created for socket ${socket.id}`);
-
         const room = rooms.get(socket.roomId);
-        if (!room) {
-          return callback({ error: 'Room not found' });
-        }
+        if (!room) return callback({ error: 'Room not found' });
 
-        // CHANGED: We can store multiple producers per peer
-        if (!room.producers.has(socket.id)) {
-          room.producers.set(socket.id, []);
-        }
-        const peerProducers = room.producers.get(socket.id);
-        peerProducers.push(producer);
+        // Store the producer for this peer
+        room.addProducer(socket.id, producer);
 
-        // Notify all peers in the room about the new Producer
+        // Notify other peers in the room
         socket.to(socket.roomId).emit('newProducer', {
           producerId: producer.id,
           peerId: socket.id,
         });
-
         callback({ id: producer.id });
       } catch (error) {
         console.error('Error in transport-produce:', error);
@@ -192,9 +214,7 @@ const initWebRTC = (io, worker) => {
     // ---------------------------
     socket.on('consume', async ({ rtpCapabilities, producerId }, callback) => {
       const room = rooms.get(socket.roomId);
-      if (!room) {
-        return callback({ params: { error: 'Room not found' } });
-      }
+      if (!room) return callback({ params: { error: 'Room not found' } });
       try {
         if (!socket.consumerTransport) {
           throw new Error('Consumer transport not created. Please create it before consuming.');
@@ -210,10 +230,7 @@ const initWebRTC = (io, worker) => {
         consumer.on('transportclose', () => console.log('Consumer transport closed'));
         consumer.on('producerclose', () => console.log('Producer for consumer closed'));
 
-        // Store each consumer in a map on the socket
-        if (!socket.consumers) {
-          socket.consumers = new Map();
-        }
+        if (!socket.consumers) socket.consumers = new Map();
         socket.consumers.set(consumer.id, consumer);
 
         callback({
@@ -256,8 +273,6 @@ const initWebRTC = (io, worker) => {
     socket.on('getProducers', (callback) => {
       const room = rooms.get(socket.roomId);
       if (!room) return callback({ error: 'Room not found' });
-
-      // Flatten all producers from all peers
       const producers = [];
       for (const producersArray of room.producers.values()) {
         for (const prod of producersArray) {
@@ -274,11 +289,10 @@ const initWebRTC = (io, worker) => {
       console.log('Socket disconnected:', socket.id);
       const roomId = socket.roomId;
       if (!roomId) return;
-
       const room = rooms.get(roomId);
       if (!room) return;
 
-      // 1) Close and remove any producer(s) from this peer
+      // Close and remove any producers from this peer
       if (room.producers.has(socket.id)) {
         const producersArray = room.producers.get(socket.id);
         producersArray.forEach((producer) => {
@@ -288,7 +302,7 @@ const initWebRTC = (io, worker) => {
         room.producers.delete(socket.id);
       }
 
-      // 2) Close all consumers belonging to this peer
+      // Close all consumers for this socket
       if (socket.consumers) {
         for (const [, consumer] of socket.consumers.entries()) {
           consumer.close();
@@ -296,7 +310,7 @@ const initWebRTC = (io, worker) => {
         socket.consumers.clear();
       }
 
-      // 3) Close transports
+      // Close transports
       if (socket.producerTransport) {
         socket.producerTransport.close();
         socket.producerTransport = null;
@@ -306,11 +320,11 @@ const initWebRTC = (io, worker) => {
         socket.consumerTransport = null;
       }
 
-      // 4) Notify peers that this peer has disconnected
       socket.to(roomId).emit('peerDisconnected', { peerId: socket.id });
+      room.removePeer(socket.id);
 
-      // 5) If the room is now empty, close router & remove it
-      if (room.producers.size === 0) {
+      // If room is empty, close its router and delete the room
+      if (room.isEmpty()) {
         room.router.close();
         rooms.delete(roomId);
         console.log(`Room ${roomId} deleted as it is now empty.`);
@@ -324,7 +338,6 @@ const initWebRTC = (io, worker) => {
       console.log(`Socket ${socket.id} is leaving its current room`);
       const roomId = socket.roomId;
       if (!roomId) return;
-
       const room = rooms.get(roomId);
       if (!room) return;
 
@@ -356,15 +369,12 @@ const initWebRTC = (io, worker) => {
         socket.consumerTransport = null;
       }
 
-      // Notify peers that this peer has disconnected
       socket.to(roomId).emit('peerDisconnected', { peerId: socket.id });
-
-      // Actually leave the socket.io room
       socket.leave(roomId);
       socket.roomId = null;
+      room.removePeer(socket.id);
 
-      // If no other producers remain, remove the room completely
-      if (room.producers.size === 0) {
+      if (room.isEmpty()) {
         room.router.close();
         rooms.delete(roomId);
         console.log(`Room ${roomId} deleted as it is now empty.`);

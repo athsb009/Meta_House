@@ -7,12 +7,21 @@ import io from "socket.io-client";
 const GameSpace = ({ onProximityChange }) => {
   const gameRef = useRef(null);
   const socketRef = useRef(null);
-  const gameContainerRef = useRef(null); // Ref for the canvas container.
+  const gameContainerRef = useRef(null);
   const navigate = useNavigate();
   const { roomId } = useParams();
+
+  // Track room info
   const [numPlayers, setNumPlayers] = useState(0);
+  const [playersInRoom, setPlayersInRoom] = useState([]);
   const [profile, setProfile] = useState(null);
 
+  // For in-game chat
+ 
+
+  // -------------------
+  //    HANDLERS
+  // -------------------
   const handleLogout = () => {
     localStorage.removeItem("token");
     localStorage.removeItem("username");
@@ -28,6 +37,10 @@ const GameSpace = ({ onProximityChange }) => {
     console.log("Navigating to lobby");
   };
 
+  
+  // -------------------
+  //   DATA FETCH
+  // -------------------
   const fetchProfile = async () => {
     try {
       const token = localStorage.getItem("token");
@@ -46,32 +59,43 @@ const GameSpace = ({ onProximityChange }) => {
     }
   };
 
-  // Fetch profile on mount.
+  // Fetch profile on mount
   useEffect(() => {
     fetchProfile();
   }, []);
 
-  // Initialize Phaser and socket only when profile, roomId, and container ref are available.
+  // -------------------------
+  //  SOCKET & PHASER SETUP
+  // -------------------------
   useEffect(() => {
+    // Only start if we have a profile & roomId & container
     if (!profile || !roomId || !gameContainerRef.current) return;
 
+    // Initialize Socket
     socketRef.current = io("http://localhost:3001/game");
     const socket = socketRef.current;
-    socket.emit("joinGame", {
-      roomId,
-      username: profile.username,
-    });
+
+    // Join game room
+    socket.emit("joinGame", { roomId, username: profile.username });
+
+    // Listen for room updates (e.g., number of players, player list)
     socket.on("roomInfo", (data) => {
       if (data && typeof data.numPlayers === "number") {
         setNumPlayers(data.numPlayers);
       }
+      // If your server sends `players` array in roomInfo:
+      if (Array.isArray(data.players)) {
+        setPlayersInRoom(data.players);
+      }
     });
 
-    const username = profile.username;
+  
+
+    // Create Phaser Game
     const container = gameContainerRef.current;
-    // Get container dimensions for full-screen.
     const canvasWidth = container.offsetWidth;
     const canvasHeight = container.offsetHeight;
+    const username = profile.username;
 
     const config = {
       parent: container,
@@ -84,22 +108,41 @@ const GameSpace = ({ onProximityChange }) => {
       },
       scene: {
         preload: function () {
+          // Load assets
           this.load.atlas("king", "../assets/king.png", "../assets/king_atlas.json");
           this.load.animation("king_anim", "../assets/king_anim.json");
         },
         create: function () {
+          // Draw a background grid
           const gridWidth = this.sys.game.config.width;
           const gridHeight = this.sys.game.config.height;
           this.add
-            .grid(gridWidth / 2, gridHeight / 2, gridWidth, gridHeight, 50, 50, 0x222222, 0x888888, 0.3)
+            .grid(
+              gridWidth / 2,
+              gridHeight / 2,
+              gridWidth,
+              gridHeight,
+              50,
+              50,
+              0x222222,
+              0x888888,
+              0.3
+            )
             .setDepth(-1);
 
-          // Create local player sprite and name tag.
-          this.player = this.physics.add.sprite(gridWidth / 2, gridHeight / 2, "king", "king_idle_1");
+          // Create local player sprite
+          this.player = this.physics.add.sprite(
+            gridWidth / 2,
+            gridHeight / 2,
+            "king",
+            "king_idle_1"
+          );
           this.player.setScale(2);
           this.player.setCollideWorldBounds(true);
+
+          // Player name tag
           this.playerName = this.add
-            .text(gridWidth / 2, gridHeight / 2 - 25, username, {
+            .text(this.player.x, this.player.y - 25, username, {
               fontSize: "16px",
               fill: "#ffffff",
               backgroundColor: "#000000",
@@ -107,22 +150,28 @@ const GameSpace = ({ onProximityChange }) => {
             })
             .setOrigin(0.5, 1);
 
+          // Input controls
           this.cursors = this.input.keyboard.createCursorKeys();
+
+          // Group for other players
           this.otherPlayers = this.physics.add.group();
           this.lastEmitTime = 0;
 
-          // Remote player movement update.
+          // Listen for remote player movement
           socket.on("playerMoved", (data) => {
-            let otherPlayer = this.otherPlayers.getChildren().find(
-              (player) => player.id === data.id
-            );
+            let otherPlayer = this.otherPlayers
+              .getChildren()
+              .find((p) => p.id === data.id);
             if (!otherPlayer) {
+              // Create sprite for new remote player
               otherPlayer = this.physics.add.sprite(data.x, data.y, "king", "king_idle_1");
               otherPlayer.setScale(2);
               otherPlayer.setCollideWorldBounds(true);
               otherPlayer.setImmovable(true);
               otherPlayer.id = data.id;
               this.otherPlayers.add(otherPlayer);
+
+              // Create remote player's name tag
               otherPlayer.nameTag = this.add
                 .text(data.x, data.y - 25, data.username, {
                   fontSize: "16px",
@@ -132,6 +181,7 @@ const GameSpace = ({ onProximityChange }) => {
                 })
                 .setOrigin(0.5, 1);
             } else {
+              // Update position
               otherPlayer.setPosition(data.x, data.y);
               if (otherPlayer.nameTag) {
                 otherPlayer.nameTag
@@ -141,16 +191,25 @@ const GameSpace = ({ onProximityChange }) => {
             }
           });
 
+          // When a new user connects
           socket.on("userConnected", (user) => {
-            const exists = this.otherPlayers.getChildren().some((p) => p.id === user.id);
+            const exists = this.otherPlayers
+              .getChildren()
+              .some((p) => p.id === user.id);
             if (!exists) {
-              const otherPlayer = this.physics.add.sprite(user.x, user.y, "king", "king_idle_1");
+              const otherPlayer = this.physics.add.sprite(
+                user.x,
+                user.y,
+                "king",
+                "king_idle_1"
+              );
               otherPlayer.setScale(2);
               otherPlayer.setCollideWorldBounds(true);
               otherPlayer.setImmovable(true);
               otherPlayer.id = user.id;
-              
               this.otherPlayers.add(otherPlayer);
+
+              // Create name tag
               otherPlayer.nameTag = this.add
                 .text(user.x, user.y - 25, user.username, {
                   fontSize: "16px",
@@ -162,10 +221,11 @@ const GameSpace = ({ onProximityChange }) => {
             }
           });
 
+          // When a user disconnects
           socket.on("userDisconnected", (id) => {
-            const otherPlayer = this.otherPlayers.getChildren().find(
-              (player) => player.id === id
-            );
+            const otherPlayer = this.otherPlayers
+              .getChildren()
+              .find((p) => p.id === id);
             if (otherPlayer) {
               if (otherPlayer.nameTag) {
                 otherPlayer.nameTag.destroy();
@@ -174,48 +234,46 @@ const GameSpace = ({ onProximityChange }) => {
             }
           });
 
-          // Initialize current call target.
+          // Track which player is currently within proximity
           this.currentCallTarget = null;
         },
         update: function (time) {
           const speed = 200;
           this.player.body.setVelocity(0);
-          let moving = false;
 
+          // Movement logic
           if (this.cursors.left.isDown) {
             this.player.body.setVelocityX(-speed);
-            moving = true;
           } else if (this.cursors.right.isDown) {
             this.player.body.setVelocityX(speed);
-            moving = true;
           }
           if (this.cursors.up.isDown) {
             this.player.body.setVelocityY(-speed);
-            moving = true;
           } else if (this.cursors.down.isDown) {
             this.player.body.setVelocityY(speed);
-            moving = true;
           }
 
-          this.player.anims.play(
-            this.player.body.velocity.x !== 0 || this.player.body.velocity.y !== 0
-              ? "king_walk"
-              : "king_idle",
-            true
-          );
+          // Play proper animations
+          if (this.player.body.velocity.x !== 0 || this.player.body.velocity.y !== 0) {
+            this.player.anims.play("king_walk", true);
+          } else {
+            this.player.anims.play("king_idle", true);
+          }
 
-          if (time - this.lastEmitTime > 100) {
+          // Emit movement to server (rate-limited)
+          if (time - this.lastEmitTime > 0) {
             socket.emit("move", {
               x: this.player.x,
               y: this.player.y,
-              username,
+              username: username,
             });
             this.lastEmitTime = time;
           }
 
+          // Update local player's name tag position
           this.playerName.setPosition(this.player.x, this.player.y - 25);
 
-          // Proximity detection.
+          // Proximity detection
           const proximityThreshold = 100;
           let closestPlayer = null;
           let minDistance = Infinity;
@@ -234,6 +292,7 @@ const GameSpace = ({ onProximityChange }) => {
 
           if (closestPlayer) {
             this.player.setTint(0xffff00);
+            // If newly in proximity, notify parent
             if (!this.currentCallTarget || this.currentCallTarget.id !== closestPlayer.id) {
               this.currentCallTarget = {
                 id: closestPlayer.id,
@@ -246,6 +305,7 @@ const GameSpace = ({ onProximityChange }) => {
             }
           } else {
             this.player.clearTint();
+            // If no longer in proximity, notify parent
             if (this.currentCallTarget) {
               this.currentCallTarget = null;
               if (typeof onProximityChange === "function") {
@@ -259,7 +319,7 @@ const GameSpace = ({ onProximityChange }) => {
 
     gameRef.current = new Phaser.Game(config);
 
-    // Handle window resize to adjust canvas dimensions.
+    // Handle window resizing
     const handleResize = () => {
       if (gameRef.current && gameRef.current.scale && gameContainerRef.current) {
         const newWidth = gameContainerRef.current.offsetWidth;
@@ -267,10 +327,9 @@ const GameSpace = ({ onProximityChange }) => {
         gameRef.current.scale.resize(newWidth, newHeight);
       }
     };
-
     window.addEventListener("resize", handleResize);
 
-    // Cleanup on unmount.
+    // Cleanup on unmount
     return () => {
       if (gameRef.current) {
         gameRef.current.destroy(true);
@@ -282,9 +341,12 @@ const GameSpace = ({ onProximityChange }) => {
     };
   }, [profile, roomId, onProximityChange, navigate]);
 
+  // -------------------
+  //     RENDER
+  // -------------------
   return (
     <div className="relative w-full h-screen bg-gray-100">
-      {/* Header with room info and controls */}
+      {/* Header / Controls */}
       <div className="absolute top-0 left-0 right-0 p-4 bg-white shadow flex justify-between items-center z-10">
         <div>
           <p className="text-lg font-semibold">Room ID: {roomId}</p>
@@ -306,8 +368,12 @@ const GameSpace = ({ onProximityChange }) => {
         </div>
       </div>
 
-      {/* Canvas container that fills available space */}
+      {/* Canvas container for the Phaser game */}
       <div ref={gameContainerRef} className="w-full h-full pt-16" />
+
+      {/* Player List on the right (if server sends a list of current players) */}
+     
+
     </div>
   );
 };

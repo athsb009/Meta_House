@@ -30,7 +30,7 @@ const RemoteVideo = ({ id, stream }) => {
   );
 };
 
-const VideoApp = ({ remotePeer, onCallEnd }) => {
+const VideoApp = ({ remotePeer, roomId: propRoomId, onCallEnd }) => {
   // --- Refs for Mediasoup and Socket Objects ---
   const socketRef = useRef(null);
   const deviceRef = useRef(null);
@@ -54,9 +54,9 @@ const VideoApp = ({ remotePeer, onCallEnd }) => {
   });
 
   // --- Local State for UI ---
-  const { roomId: roomFromParams } = useParams();
+
   // If remotePeer exists, use its roomId; otherwise fallback to URL param.
-  const [roomId, setRoomId] = useState(remotePeer?.roomId || roomFromParams || '');
+  const [roomId, setRoomId] = useState(propRoomId ||'');
   const [joined, setJoined] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
   const [error, setError] = useState(null);
