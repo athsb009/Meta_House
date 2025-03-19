@@ -45,7 +45,7 @@ const io = new Server(server, {
 // Create separate namespaces for video and game events
 const videoNamespace = io.of('/video');
 const gameNamespace = io.of('/game');
-
+const chatNamespace = io.of('/chat');
 // ----- Mediasoup Worker & Global Variables -----
 let worker;
 (async () => {
@@ -77,6 +77,50 @@ gameNamespace.on('connection', (socket) => {
   console.log(`Game client connected: ${socket.id}`);
   gameEvents(socket, gameNamespace);
 });
+const onlineUsers = {};
+chatNamespace.on('connection', (socket) => {
+  console.log(`Chat client connected: ${socket.id}`);
+
+  // Handle joining any chat room (global or private)
+  socket.on('joinChat', ({ roomId, username }) => {
+    socket.join(roomId);
+    socket.username = username;
+    // Save username in a normalized form (trimmed and lowercased)
+    onlineUsers[username.trim().toLowerCase()] = socket.id;
+    console.log(`${username} joined chat room ${roomId}`);
+  });
+
+  // When a sender initiates a private chat
+  socket.on('initiatePrivateChat', ({ senderUsername, receiverUsername, roomId }) => {
+    console.log(`Private chat initiated by ${senderUsername} for ${receiverUsername} in room ${roomId}`);
+    const normalizedReceiver = receiverUsername.trim().toLowerCase();
+    const receiverSocketId = onlineUsers[normalizedReceiver];
+    if (receiverSocketId) {
+      // Forward the private chat invitation to the receiver
+      chatNamespace.to(receiverSocketId).emit('privateChatInvitation', {
+        roomId,
+        senderUsername,
+      });
+    } else {
+      // Optionally notify the sender that the receiver is offline
+      socket.emit('privateChatError', { message: 'Receiver not online' });
+    }
+  });
+
+  // Regular chat message handler
+  socket.on('chatMessage', ({ roomId, message }) => {
+    console.log(`Message in room ${roomId} from ${socket.username}: ${message.text}`);
+    socket.to(roomId).emit('chatMessage', message);
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`Chat client disconnected: ${socket.id}`);
+    if (socket.username) {
+      delete onlineUsers[socket.username.trim().toLowerCase()];
+    }
+  });
+});
+
 
 // Start the HTTP server.
 server.listen(3001, () => {

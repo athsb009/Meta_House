@@ -109,8 +109,10 @@ const GameSpace = ({ onProximityChange }) => {
       scene: {
         preload: function () {
           // Load assets
-          this.load.atlas("king", "../assets/king.png", "../assets/king_atlas.json");
-          this.load.animation("king_anim", "../assets/king_anim.json");
+          // this.load.atlas("king", "../assets/king.png", "../assets/king_atlas.json");
+          // this.load.animation("king_anim", "../assets/king_anim.json");
+          this.load.atlas("adam", "/assets/adam.png", "/assets/adam_atlas.json");
+
         },
         create: function () {
           // Draw a background grid
@@ -124,7 +126,7 @@ const GameSpace = ({ onProximityChange }) => {
               gridHeight,
               50,
               50,
-              0x222222,
+              0xffffff,
               0x888888,
               0.3
             )
@@ -134,8 +136,8 @@ const GameSpace = ({ onProximityChange }) => {
           this.player = this.physics.add.sprite(
             gridWidth / 2,
             gridHeight / 2,
-            "king",
-            "king_idle_1"
+            "adam",
+            "adam_idle_16x16_down"
           );
           this.player.setScale(2);
           this.player.setCollideWorldBounds(true);
@@ -159,18 +161,16 @@ const GameSpace = ({ onProximityChange }) => {
 
           // Listen for remote player movement
           socket.on("playerMoved", (data) => {
-            let otherPlayer = this.otherPlayers
-              .getChildren()
-              .find((p) => p.id === data.id);
+            let otherPlayer = this.otherPlayers.getChildren().find((p) => p.id === data.id);
             if (!otherPlayer) {
-              // Create sprite for new remote player
-              otherPlayer = this.physics.add.sprite(data.x, data.y, "king", "king_idle_1");
+              // Create sprite for new remote player, setting frame based on direction
+              otherPlayer = this.physics.add.sprite(data.x, data.y, "adam", `adam_idle_16x16_${data.direction || "down"}`);
               otherPlayer.setScale(2);
               otherPlayer.setCollideWorldBounds(true);
               otherPlayer.setImmovable(true);
               otherPlayer.id = data.id;
               this.otherPlayers.add(otherPlayer);
-
+          
               // Create remote player's name tag
               otherPlayer.nameTag = this.add
                 .text(data.x, data.y - 25, data.username, {
@@ -181,8 +181,12 @@ const GameSpace = ({ onProximityChange }) => {
                 })
                 .setOrigin(0.5, 1);
             } else {
-              // Update position
+              // Update position and frame if movement includes a direction.
               otherPlayer.setPosition(data.x, data.y);
+              if (data.direction) {
+                otherPlayer.setFrame(`adam_idle_16x16_${data.direction}`);
+              }
+              // Update name tag position and text
               if (otherPlayer.nameTag) {
                 otherPlayer.nameTag
                   .setPosition(data.x, data.y - 25)
@@ -190,7 +194,6 @@ const GameSpace = ({ onProximityChange }) => {
               }
             }
           });
-
           // When a new user connects
           socket.on("userConnected", (user) => {
             const exists = this.otherPlayers
@@ -200,8 +203,8 @@ const GameSpace = ({ onProximityChange }) => {
               const otherPlayer = this.physics.add.sprite(
                 user.x,
                 user.y,
-                "king",
-                "king_idle_1"
+                "adam",
+                "adam_idle_16x16_down"
               );
               otherPlayer.setScale(2);
               otherPlayer.setCollideWorldBounds(true);
@@ -240,39 +243,50 @@ const GameSpace = ({ onProximityChange }) => {
         update: function (time) {
           const speed = 200;
           this.player.body.setVelocity(0);
-
-          // Movement logic
+          let direction = null;
+        
+          // Check horizontal movement
           if (this.cursors.left.isDown) {
             this.player.body.setVelocityX(-speed);
+            direction = "left";
           } else if (this.cursors.right.isDown) {
             this.player.body.setVelocityX(speed);
+            direction = "right";
           }
+        
+          // Check vertical movement
           if (this.cursors.up.isDown) {
             this.player.body.setVelocityY(-speed);
+            direction = "up";
           } else if (this.cursors.down.isDown) {
             this.player.body.setVelocityY(speed);
+            direction = "down";
           }
-
-          // Play proper animations
-          if (this.player.body.velocity.x !== 0 || this.player.body.velocity.y !== 0) {
-            this.player.anims.play("king_walk", true);
+        
+          // If a direction is detected, update lastDirection
+          if (direction) {
+            this.lastDirection = direction;
           } else {
-            this.player.anims.play("king_idle", true);
+            // No new input; retain the last direction
+            direction = this.lastDirection || "down";
           }
-
-          // Emit movement to server (rate-limited)
+        
+          // Set the sprite's frame based on the current or last known direction
+          this.player.setFrame(`adam_idle_16x16_${direction}`);
+        
+          // Update player name tag position
+          this.playerName.setPosition(this.player.x, this.player.y - 25);
+        
+          // Emit movement data to the server with the correct direction
           if (time - this.lastEmitTime > 0) {
             socket.emit("move", {
               x: this.player.x,
               y: this.player.y,
               username: username,
+              direction: direction, // This will be the last known direction if idle
             });
             this.lastEmitTime = time;
           }
-
-          // Update local player's name tag position
-          this.playerName.setPosition(this.player.x, this.player.y - 25);
-
           // Proximity detection
           const proximityThreshold = 100;
           let closestPlayer = null;
